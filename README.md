@@ -33,7 +33,7 @@ Provides CSR/key regeneration, SAN building with range expansion, renewal orches
 Install directly from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/klokom/step-npm-cert/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/klokom/step-npm-cert/main/install.sh | bash
 ```
 
 This installs:
