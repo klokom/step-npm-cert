@@ -112,7 +112,7 @@ build_san_args() {
   for item in "${SAN_INPUT[@]}"; do
     item="$(normalize_domain "$item")"
     [[ -z "$item" ]] && continue
-    if [[ "$item" =~ \.[0-9]+-[0-9]+$ ]] || [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+    if [[ "$item" =~ ^([0-9]+\.){3}[0-9]+-[0-9]+$ ]]; then
       while read -r e; do values+=("$e"); done < <(expand_ip_range "$item")
     else
       while read -r e; do values+=("$e"); done < <(expand_host_range "$item")
