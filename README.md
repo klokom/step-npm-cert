@@ -28,6 +28,54 @@ Provides CSR/key regeneration, SAN building with range expansion, renewal orches
 
 ---
 
+## 📥 Installation (recommended)
+
+Install directly from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/klokom/step-npm-cert/main/install.sh | sh
+```
+
+This installs:
+
+* Binary → `/usr/local/bin/step-npm-cert`
+* Default config → `/etc/step-npm-cert.conf` (only if missing)
+
+Verify:
+
+```bash
+step-npm-cert --help
+```
+
+---
+
+## 📥 Manual Installation (clone + install)
+
+```
+git clone https://github.com/klokom/step-npm-cert.git
+cd step-npm-cert
+bash install.sh
+```
+
+---
+
+## 🔧 Updating
+
+```
+curl -fsSL https://raw.githubusercontent.com/klokom/step-npm-cert/main/install.sh | sh
+```
+
+---
+
+## 🗑 Uninstall
+
+```
+sudo rm -f /usr/local/bin/step-npm-cert
+sudo rm -f /etc/step-npm-cert.conf
+```
+
+---
+
 ## ⚙ Configuration
 
 Configuration is optional and stored in:
