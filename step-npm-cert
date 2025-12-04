@@ -12,7 +12,7 @@ LOCKFILE="/tmp/issue-cert.lock"
 NOT_AFTER="8760h"
 
 # Load config overrides
-[[ -f /etc/issue-cert.conf ]] && source /etc/issue-cert.conf
+[[ -f /etc/step-npm-cert.conf ]] && source /etc/step-npm-cert.conf
 
 # Apply fallbacks
 RELOAD_NPM="${AUTO_RELOAD_NPM:-0}"
