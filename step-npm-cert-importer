@@ -114,7 +114,9 @@ import_one_cert() {
     local crt key existing id
     crt="$(fs_read_cert "$domain")"
     key="$(fs_read_key "$domain")"
-    id="$(echo "$npm_certs" | jq -r ".[] | select(.name==\"$domain\") | .id")"
+
+    id="$(echo "$npm_certs" | jq -r --arg d "$domain" \
+        '.[] | select((.nice_name // .domain_names[0]) == $d) | .id')"
 
     if [[ -z "$id" ]]; then
         log_info "Importing $domain"
@@ -122,7 +124,9 @@ import_one_cert() {
         npm_api_create_or_update_certificate "$token" "$domain" "$crt" "$key"
         log_ok "Imported $domain"
     else
-        existing="$(echo "$npm_certs" | jq -r ".[] | select(.name==\"$domain\") | .certificate")"
+        existing="$(echo "$npm_certs" | jq -r --arg d "$domain" \
+            '.[] | select((.nice_name // .domain_names[0]) == $d) | .certificate')"
+
         if certs_differ "$existing" "$crt"; then
             log_info "Updating $domain"
             [[ "$dry" == "true" ]] && return
@@ -164,7 +168,7 @@ npm_certs="$(npm_api_get_certificates "$token")"
 case "$MODE" in
   list)
     echo "--- FS ---"; fs_cert_list | sort
-    echo "--- NPM ---"; echo "$npm_certs" | jq -r '.[].name' | sort
+    echo "--- NPM ---"; echo "$npm_certs" | jq -r '.[] | (.nice_name // .domain_names[0])' | sort
     exit 0 ;;
   none)
     [[ ${#DOMAINS[@]} -eq 0 ]] && die "No mode selected" ;;
@@ -177,7 +181,8 @@ fi
 
 if [[ "$MODE" == "import-new" ]]; then
     for d in $(fs_cert_list); do
-        if ! echo "$npm_certs" | jq -e ".[] | select(.name==\"$d\")" >/dev/null; then
+        if ! echo "$npm_certs" | jq -e --arg d "$d" \
+            '.[] | select((.nice_name // .domain_names[0]) == $d)' >/dev/null; then
             import_one_cert "$token" "$d" "$DRY_RUN"
         fi
     done
@@ -185,9 +190,10 @@ elif [[ "$MODE" == "import-all" || "$MODE" == "sync" ]]; then
     for d in $(fs_cert_list); do import_one_cert "$token" "$d" "$DRY_RUN"; done
 elif [[ "$MODE" == "prune" ]]; then
     [[ "$FORCE" == "true" ]] || { read -rp "Prune? (y/N): " ans; [[ "${ans,,}" == "y" ]] || die "Aborted"; }
-    for d in $(echo "$npm_certs" | jq -r '.[].name'); do
+    for d in $(echo "$npm_certs" | jq -r '.[] | (.nice_name // .domain_names[0])'); do
         if [[ ! -f "$CERTDIR/$d.crt" ]]; then
-            id="$(echo "$npm_certs" | jq -r ".[] | select(.name==\"$d\") | .id")"
+            id="$(echo "$npm_certs" | jq -r --arg d "$d" \
+                '.[] | select((.nice_name // .domain_names[0]) == $d) | .id')"
             prune_one "$token" "$id" "$d" "$DRY_RUN"
         fi
     done
