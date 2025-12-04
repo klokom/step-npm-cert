@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Hardcoded defaults
+CA_URL="https://ca.lab:9000"
+PROV_PW_FILE="/root/.step/secrets/password"
+CERTDIR="/data/nginx/certificates"
+NPM_SERVICE="npm.service"
+DEFAULT_RENEW_DAYS=30
+LOCKFILE="/tmp/issue-cert.lock"
+NOT_AFTER="8760h"
+
+# Load config overrides
+[[ -f /etc/issue-cert.conf ]] && source /etc/issue-cert.conf
+
+# Apply fallbacks
+RELOAD_NPM="${AUTO_RELOAD_NPM:-0}"
+RENEW_DAYS="${RENEW_DAYS:-$DEFAULT_RENEW_DAYS}"
+COLOR="${COLOR:-auto}"
+QUIET="${QUIET:-false}"
+
+# Color detection
+if [[ "$COLOR" == "true" ]] || { [[ "$COLOR" == "auto" ]] && [[ -t 1 ]]; }; then
+  C_RESET=$'\033[0m' C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m' C_BOLD=$'\033[1m'
+else
+  C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD=""
+fi
+
+# Logging
+if [[ "$QUIET" == "true" ]]; then
+  log_info() { :; }
+  log_ok()   { :; }
+  log_warn() { :; }
+else
+  log_info() { echo "${C_CYAN}[*]${C_RESET} $*"; }
+  log_ok()   { echo "${C_GREEN}[+]${C_RESET} $*"; }
+  log_warn() { echo "${C_YELLOW}[!]${C_RESET} $*"; }
+fi
+
+die() { echo "${C_RED}[X]${C_RESET} $*" >&2; exit 1; }
+
+STEP="$(command -v step)" || die "step CLI missing"
+OPENSSL="$(command -v openssl)" || die "openssl missing"
+
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then die "Another instance is running"; fi
+trap 'flock -u 200; rm -f "$LOCKFILE" 2>/dev/null || true' EXIT INT TERM
+
+normalize_domain() {
+  local d="$1"
+  d="${d#"${d%%[![:space:]]*}"}"
+  d="${d%"${d##*[![:space:]]}"}"
+  d="${d%.}"
+  echo "${d,,}"
+}
+
+expand_host_range() {
+  [[ $1 =~ ^([^[]*)\[([0-9]+)-([0-9]+)\]([^[]*)$ ]] &&
+    for i in $(seq "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"); do echo "${BASH_REMATCH[1]}${i}${BASH_REMATCH[4]}"; done || echo "$1"
+}
+
+expand_ip_range() {
+  [[ $1 =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)-([0-9]+)$ ]] &&
+    for i in $(seq "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"); do echo "${BASH_REMATCH[1]}.${i}"; done || echo "$1"
+}
+
+dedupe() { sort -u; }
+
+ensure_certdir() { mkdir -p "$CERTDIR"; }
+crt_path() { echo "$CERTDIR/$1.crt"; }
+key_path() { echo "$CERTDIR/$1.key"; }
+csr_path() { echo "$CERTDIR/$1.csr"; }
+
+days_until_expiry() {
+  local crt="$1" end_str end_epoch now_epoch days
+  [[ -f "$crt" ]] || return 1
+  end_str="$($OPENSSL x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+  end_epoch=$(date -d "$end_str" +%s 2>/dev/null) || return 1
+  now_epoch=$(date +%s)
+  days=$(((end_epoch - now_epoch) / 86400))
+  (( days < 0 )) && days=0
+  echo "$days"
+}
+
+extract_sans() {
+  $OPENSSL x509 -in "$1" -noout -ext subjectAltName 2>/dev/null |
+    sed -n '2,$p' | tr -d ' \t' | tr ',' '\n' |
+    sed -E 's/^(dns|DNS|ip|IP|IP.?Address|ip.?address)[[:space:]]*[:=]?//g' |
+    sed -E 's/\.$//' | sed '/^$/d'
+}
+
+extract_cn() {
+  $OPENSSL x509 -in "$1" -noout -subject 2>/dev/null |
+    grep -o 'CN[[:space:]]*=[[:space:]]*[^,]*' | tail -1 | cut -d= -f2- |
+    sed 's/[[:space:]]*$//'
+}
+
+restart_npm() {
+  [[ "$RELOAD_NPM" -eq 0 ]] && return 0
+  log_info "Restarting NPM..."
+  if command -v systemctl >/dev/null && systemctl is-active --quiet "$NPM_SERVICE"; then
+    systemctl restart "$NPM_SERVICE" && log_ok "NPM restarted" || log_warn "Restart failed"
+  else
+    log_warn "systemd/NPM service unavailable"
+  fi
+}
+
+build_san_args() {
+  local values=()
+  [[ -n "$DOMAIN" ]] && values+=("$DOMAIN")
+  for item in "${SAN_INPUT[@]}"; do
+    item="$(normalize_domain "$item")"
+    [[ -z "$item" ]] && continue
+    if [[ "$item" =~ \.[0-9]+-[0-9]+$ ]] || [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+      while read -r e; do values+=("$e"); done < <(expand_ip_range "$item")
+    else
+      while read -r e; do values+=("$e"); done < <(expand_host_range "$item")
+    fi
+  done
+  mapfile -t values < <(printf '%s\n' "${values[@]}" | dedupe)
+  SAN_ARGS=(--san "$DOMAIN")
+  for v in "${values[@]}"; do [[ -n "$v" && "$v" != "$DOMAIN" ]] && SAN_ARGS+=(--san "$v"); done
+}
+
+issue_certificate() {
+  local allow_overwrite="$1"
+  ensure_certdir
+  local crt="$(crt_path "$DOMAIN")" key="$(key_path "$DOMAIN")" csr="$(csr_path "$DOMAIN")"
+
+  if [[ "$allow_overwrite" -eq 0 ]]; then
+    [[ -f "$crt" || -f "$key" ]] && die "Files exist for '$DOMAIN' – use --renew"
+  else
+    rm -f "$csr"
+  fi
+
+  log_info "Generating CSR for '$DOMAIN'..."
+  "$STEP" certificate create "$DOMAIN" "$csr" "$key" --csr --no-password --insecure "${SAN_ARGS[@]}" || die "CSR failed"
+
+  log_info "Requesting token..."
+  local token
+  token="$("$STEP" ca token "$DOMAIN" "${SAN_ARGS[@]}" --ca-url="$CA_URL" --provisioner-password-file="$PROV_PW_FILE" --not-after="$NOT_AFTER")" || die "Token failed"
+
+  log_info "Signing..."
+  "$STEP" ca sign "$csr" "$crt" --token "$token" --ca-url="$CA_URL" || die "Signing failed"
+
+  chmod 600 "$key" "$crt" "$csr"
+  log_ok "Issued: $DOMAIN"
+  restart_npm
+}
+
+interactive_mode() {
+  [[ "$NON_INTERACTIVE" -eq 1 ]] && die "Domain required in non-interactive mode"
+  echo "${C_BOLD}=== Interactive Mode ===${C_RESET}"
+  read -rp "Common Name (CN): " input; DOMAIN="$(normalize_domain "$input")"
+  [[ -z "$DOMAIN" ]] && die "Domain required"
+  read -rp "DNS SANs (comma-separated): " hosts
+  read -rp "IP SANs (comma-separated): " ips
+
+  SAN_INPUT=()
+  IFS=',' read -ra items <<< "$hosts,$ips"
+  for i in "${items[@]}"; do
+    i="$(normalize_domain "$i")"
+    [[ -z "$i" ]] && continue
+    if [[ "$i" =~ \.[0-9]+-[0-9]+$ ]] || [[ "$i" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+      while read -r e; do SAN_INPUT+=("$e"); done < <(expand_ip_range "$i")
+    else
+      while read -r e; do SAN_INPUT+=("$e"); done < <(expand_host_range "$i")
+    fi
+  done
+
+  [[ "$RELOAD_NPM" -eq 0 ]] && read -rp "Restart NPM? (y/N): " ans && [[ "${ans,,}" == "y" ]] && RELOAD_NPM=1
+}
+
+mode_issue() {
+  [[ -z "$DOMAIN" ]] && interactive_mode
+  build_san_args
+  issue_certificate 0
+}
+
+mode_renew_one() {
+  [[ -z "$RENEW_DOMAIN" ]] && die "--renew requires domain"
+  local crt
+  crt="$(crt_path "$RENEW_DOMAIN")"
+  [[ -f "$crt" ]] || die "Cert not found: $crt"
+
+  local cn
+  cn=$(extract_cn "$crt" 2>/dev/null || echo "")
+  [[ -z "$cn" ]] && cn=$(basename "$crt" .crt)
+  DOMAIN=$(normalize_domain "$cn")
+
+  SAN_INPUT=()
+  while read -r s; do SAN_INPUT+=("$(normalize_domain "$s")"); done < <(extract_sans "$crt")
+  build_san_args
+
+  log_info "Renewing '$DOMAIN' (expires in $(days_until_expiry "$crt") days)"
+  issue_certificate 1
+}
+
+mode_renew_all() {
+  ensure_certdir
+  shopt -s nullglob
+  log_info "Scanning certs expiring in ≤ $RENEW_DAYS days..."
+  local renewed=0 saved_reload="$RELOAD_NPM"
+  RELOAD_NPM=0
+
+  for crt in "$CERTDIR"/*.crt; do
+    local days
+    days=$(days_until_expiry "$crt") || continue
+    (( days > RENEW_DAYS )) && continue
+
+    local cn
+    cn=$(extract_cn "$crt" 2>/dev/null || echo "")
+    [[ -z "$cn" ]] && cn=$(basename "$crt" .crt)
+    DOMAIN=$(normalize_domain "$cn")
+
+    log_info "Renewing $DOMAIN ($days days left)"
+    SAN_INPUT=()
+    while read -r s; do SAN_INPUT+=("$(normalize_domain "$s")"); done < <(extract_sans "$crt")
+    build_san_args
+    issue_certificate 1
+    ((renewed++))
+  done
+
+  RELOAD_NPM="$saved_reload"
+  (( renewed )) && { log_ok "Renewed: $renewed certificate(s)"; restart_npm; }
+}
+
+mode_bulk_wildcards() {
+  [[ -f "$BULK_FILE" ]] || die "File not found: $BULK_FILE"
+  local count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(normalize_domain "$line")"
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    DOMAIN="*.$line"
+    SAN_INPUT=("$line")
+    build_san_args
+    log_info "Issuing wildcard *.$line"
+    issue_certificate 0
+    ((count++))
+  done < "$BULK_FILE"
+  log_ok "Bulk complete: $count issued"
+  restart_npm
+}
+
+DOMAIN="" SAN_INPUT=() MODE="issue" RENEW_DOMAIN="" BULK_FILE="" NON_INTERACTIVE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--domain) DOMAIN="$2"; shift 2 ;;
+    --domain=*) DOMAIN="${1#*=}"; shift ;;
+    --san) SAN_INPUT+=("$(normalize_domain "$2")"); shift 2 ;;
+    --san=*) SAN_INPUT+=("$(normalize_domain "${1#*=}")"); shift ;;
+    --reload-npm) RELOAD_NPM=1; shift ;;
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --renew) MODE="renew-one"; RENEW_DOMAIN="$2"; shift 2 ;;
+    --renew=*) MODE="renew-one"; RENEW_DOMAIN="${1#*=}"; shift ;;
+    --renew-all) MODE="renew-all"; shift ;;
+    --renew-days) RENEW_DAYS="$2"; shift 2 ;;
+    --renew-days=*) RENEW_DAYS="${1#*=}"; shift ;;
+    --bulk-wildcards) MODE="bulk-wildcards"; BULK_FILE="$2"; shift 2 ;;
+    --bulk-wildcards=*) MODE="bulk-wildcards"; BULK_FILE="${1#*=}"; shift ;;
+    -h|--help) echo "Usage: $(basename "$0") [options]"; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+[[ "$NON_INTERACTIVE" -eq 1 && "$MODE" == "issue" && -z "$DOMAIN" ]] && die "Domain required in non-interactive mode"
+
+case "$MODE" in
+  issue) mode_issue ;;
+  renew-one) mode_renew_one ;;
+  renew-all) mode_renew_all ;;
+  bulk-wildcards) mode_bulk_wildcards ;;
+esac
