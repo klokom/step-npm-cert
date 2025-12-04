@@ -89,3 +89,8 @@ echo
 echo "Run:"
 echo "    $SCRIPT_MAIN --help"
 echo "    $SCRIPT_IMPORTER --help"
+echo
+echo "Note:"
+echo "  $SCRIPT_IMPORTER requires NPM_USER and NPM_PASSWORD to be set in:"
+echo "      $CONFIG_PATH"
+echo
