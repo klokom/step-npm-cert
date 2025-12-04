@@ -44,7 +44,6 @@ download_or_use_local() {
     fi
 }
 
-
 SRC_MAIN="$(download_or_use_local "$SCRIPT_MAIN")"
 SRC_IMPORTER="$(download_or_use_local "$SCRIPT_IMPORTER")"
 
