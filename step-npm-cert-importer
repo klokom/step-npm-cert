@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+CA_URL="https://ca.lab:9000"
+CERTDIR="/data/nginx/certificates"
+NPM_SERVICE="npm.service"
+LOCKFILE="/tmp/step-npm-cert-importer.lock"
+COLOR="auto"
+QUIET="false"
+NPM_API_URL="http://127.0.0.1:81/api"
+NPM_USER=""
+NPM_PASSWORD=""
+
+[[ -f /etc/step-npm-cert.conf ]] && source /etc/step-npm-cert.conf
+
+COLOR="${COLOR:-auto}"
+QUIET="${QUIET:-false}"
+CERTDIR="${CERTDIR:-/data/nginx/certificates}"
+NPM_API_URL="${NPM_API_URL:-http://127.0.0.1:81/api}"
+
+STEP="$(command -v step)" || { echo "step CLI missing"; exit 1; }
+OPENSSL="$(command -v openssl)" || { echo "openssl missing"; exit 1; }
+JQ="$(command -v jq)" || { echo "jq missing"; exit 1; }
+
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
+if [[ "$QUIET" == "true" ]]; then
+    log_info() { :; }
+    log_ok()   { :; }
+    log_warn() { :; }
+else
+    if [[ "$COLOR" == "true" ]] || { [[ "$COLOR" == "auto" ]] && [[ -t 1 ]]; }; then
+        C_RESET=$'\033[0m' C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m' C_BOLD=$'\033[1m'
+    else
+        C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_BOLD=""
+    fi
+    log_info() { echo "${C_CYAN}[*]${C_RESET} $*"; }
+    log_ok()   { echo "${C_GREEN}[+]${C_RESET} $*"; }
+    log_warn() { echo "${C_YELLOW}[!]${C_RESET} $*"; }
+fi
+die() { echo "${C_RED}[X]${C_RESET} $*" >&2; exit 1; }
+
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then die "Another importer instance is running"; fi
+trap 'flock -u 200; rm -f "$LOCKFILE" 2>/dev/null || true' EXIT INT TERM
+
+normalize_domain() {
+    local d="$1"
+    d="${d#"${d%%[![:space:]]*}"}"
+    d="${d%"${d##*[![:space:]]}"}"
+    d="${d%.}"
+    echo "${d,,}"
+}
+
+read_file_or_die() { [[ -f "$1" ]] || die "File missing: $1"; cat "$1"; }
+
+fs_cert_list() {
+    shopt -s nullglob
+    for f in "$CERTDIR"/*.crt; do basename "$f" .crt; done
+}
+
+certs_differ() {
+    local a="$1" b="$2"
+    local fp_a fp_b
+    fp_a=$(echo "$a" | "$OPENSSL" x509 -noout -fingerprint -sha256 2>/dev/null || echo "")
+    fp_b=$(echo "$b" | "$OPENSSL" x509 -noout -fingerprint -sha256 2>/dev/null || echo "")
+    [[ "$fp_a" != "$fp_b" ]]
+}
+
+fs_read_cert() { read_file_or_die "$CERTDIR/$1.crt"; }
+fs_read_key()  { read_file_or_die "$CERTDIR/$1.key"; }
+
+npm_api_login() {
+    [[ -n "$NPM_USER" && -n "$NPM_PASSWORD" ]] || die "NPM_USER/NPM_PASSWORD not set"
+    local resp token
+    resp="$(curl -fsSL -X POST "$NPM_API_URL/tokens" \
+        -H "Content-Type: application/json" \
+        --data "{\"identity\":\"$NPM_USER\",\"secret\":\"$NPM_PASSWORD\"}")" || die "NPM login failed"
+    token="$(echo "$resp" | jq -r .token)"
+    [[ "$token" != "null" && -n "$token" ]] || die "Invalid NPM token"
+    echo "$token"
+}
+
+npm_api_get_certificates() {
+    curl -fsSL -H "Authorization: Bearer $1" "$NPM_API_URL/nginx/certificates"
+}
+
+npm_api_delete_certificate() {
+    curl -fsSL -X DELETE -H "Authorization: Bearer $1" "$NPM_API_URL/nginx/certificates/$2"
+}
+
+npm_api_create_or_update_certificate() {
+    local token="$1" name="$2" crt="$3" key="$4" id="${5:-}"
+    local payload
+    payload="$(jq -nc --arg name "$name" --arg cert "$crt" --arg key "$key" \
+             '{provider:"custom",name:$name,certificate:$cert,private_key:$key}')"
+
+    if [[ -n "$id" ]]; then
+        curl -fsSL -X PUT -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+             --data "$payload" "$NPM_API_URL/nginx/certificates/$id"
+    else
+        curl -fsSL -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+             --data "$payload" "$NPM_API_URL/nginx/certificates"
+    fi
+}
+
+import_one_cert() {
+    local token="$1" domain="$2" dry="$3"
+    domain="$(normalize_domain "$domain")"
+    local crtfile="$CERTDIR/$domain.crt" keyfile="$CERTDIR/$domain.key"
+    [[ -f "$crtfile" && -f "$keyfile" ]] || { log_warn "No FS cert for $domain"; return; }
+
+    local crt key existing id
+    crt="$(fs_read_cert "$domain")"
+    key="$(fs_read_key "$domain")"
+    id="$(echo "$npm_certs" | jq -r ".[] | select(.name==\"$domain\") | .id")"
+
+    if [[ -z "$id" ]]; then
+        log_info "Importing $domain"
+        [[ "$dry" == "true" ]] && return
+        npm_api_create_or_update_certificate "$token" "$domain" "$crt" "$key"
+        log_ok "Imported $domain"
+    else
+        existing="$(echo "$npm_certs" | jq -r ".[] | select(.name==\"$domain\") | .certificate")"
+        if certs_differ "$existing" "$crt"; then
+            log_info "Updating $domain"
+            [[ "$dry" == "true" ]] && return
+            npm_api_create_or_update_certificate "$token" "$domain" "$crt" "$key" "$id"
+            log_ok "Updated $domain"
+        else
+            log_info "Unchanged $domain"
+        fi
+    fi
+}
+
+prune_one() {
+    local token="$1" id="$2" domain="$3" dry="$4"
+    log_warn "Pruning $domain"
+    [[ "$dry" == "true" ]] && return
+    npm_api_delete_certificate "$token" "$id"
+}
+
+MODE="none" DRY_RUN="false" FORCE="false" DOMAINS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --domain) DOMAINS+=("$(normalize_domain "$2")"); shift 2 ;;
+    --domain=*) DOMAINS+=("$(normalize_domain "${1#*=}")"); shift ;;
+    --list) MODE="list"; shift ;;
+    --import-new) MODE="import-new"; shift ;;
+    --import-all) MODE="import-all"; shift ;;
+    --sync) MODE="sync"; shift ;;
+    --prune) MODE="prune"; shift ;;
+    --force) FORCE="true"; shift ;;
+    --dry-run) DRY_RUN="true"; shift ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+token="$(npm_api_login)"
+npm_certs="$(npm_api_get_certificates "$token")"
+
+case "$MODE" in
+  list)
+    echo "--- FS ---"; fs_cert_list | sort
+    echo "--- NPM ---"; echo "$npm_certs" | jq -r '.[].name' | sort
+    exit 0 ;;
+  none)
+    [[ ${#DOMAINS[@]} -eq 0 ]] && die "No mode selected" ;;
+esac
+
+if [[ ${#DOMAINS[@]} -gt 0 ]]; then
+    for d in "${DOMAINS[@]}"; do import_one_cert "$token" "$d" "$DRY_RUN"; done
+    exit 0
+fi
+
+if [[ "$MODE" == "import-new" ]]; then
+    for d in $(fs_cert_list); do
+        if ! echo "$npm_certs" | jq -e ".[] | select(.name==\"$d\")" >/dev/null; then
+            import_one_cert "$token" "$d" "$DRY_RUN"
+        fi
+    done
+elif [[ "$MODE" == "import-all" || "$MODE" == "sync" ]]; then
+    for d in $(fs_cert_list); do import_one_cert "$token" "$d" "$DRY_RUN"; done
+elif [[ "$MODE" == "prune" ]]; then
+    [[ "$FORCE" == "true" ]] || { read -rp "Prune? (y/N): " ans; [[ "${ans,,}" == "y" ]] || die "Aborted"; }
+    for d in $(echo "$npm_certs" | jq -r '.[].name'); do
+        if [[ ! -f "$CERTDIR/$d.crt" ]]; then
+            id="$(echo "$npm_certs" | jq -r ".[] | select(.name==\"$d\") | .id")"
+            prune_one "$token" "$id" "$d" "$DRY_RUN"
+        fi
+    done
+fi
