@@ -32,17 +32,18 @@ trap cleanup EXIT INT TERM
 download_or_use_local() {
     local name="$1"
     if [[ -f "./$name" ]]; then
-        echo "[*] Using local $name"
+        echo "[*] Using local $name" >&2
         echo "./$name"
     else
-        echo "[*] Downloading $name..."
+        echo "[*] Downloading $name..." >&2
         local tmp
         tmp="$(mktemp)" || exit 1
         TMPFILES+=("$tmp")
-        curl -fsSL "$RAW_URL/$name" -o "$tmp" || { echo "ERROR: Failed to download $name"; exit 1; }
+        curl -fsSL "$RAW_URL/$name" -o "$tmp" || { echo "ERROR: Failed to download $name" >&2; exit 1; }
         echo "$tmp"
     fi
 }
+
 
 SRC_MAIN="$(download_or_use_local "$SCRIPT_MAIN")"
 SRC_IMPORTER="$(download_or_use_local "$SCRIPT_IMPORTER")"
