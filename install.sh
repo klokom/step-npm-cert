@@ -3,34 +3,64 @@ set -euo pipefail
 
 REPO="klokom/step-npm-cert"
 RAW_URL="https://raw.githubusercontent.com/$REPO/main"
-SCRIPT_NAME="step-npm-cert"
-INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
+
+SCRIPT_MAIN="step-npm-cert"
+SCRIPT_IMPORTER="step-npm-cert-importer"
+
+INSTALL_MAIN="/usr/local/bin/$SCRIPT_MAIN"
+INSTALL_IMPORTER="/usr/local/bin/$SCRIPT_IMPORTER"
+
 CONFIG_PATH="/etc/step-npm-cert.conf"
 
-echo "== step-npm-cert Installer =="
-echo
+echo "== step-npm-cert Suite Installer =="
 
-# Detect run mode
-if [[ -f "./$SCRIPT_NAME" ]]; then
-    SOURCE_SCRIPT="./$SCRIPT_NAME"
-    echo "[*] Using local script: $SOURCE_SCRIPT"
-else
-    SOURCE_SCRIPT="$(mktemp)" || exit 1
-    trap 'rm -f "$SOURCE_SCRIPT"' EXIT INT TERM
-    echo "[*] Downloading $SCRIPT_NAME from GitHub..."
-    curl -fsSL "$RAW_URL/$SCRIPT_NAME" -o "$SOURCE_SCRIPT"
-fi
+# ---------------------- Dependency Checks ----------------------
+command -v step >/dev/null    || { echo "ERROR: 'step' CLI is required"; exit 1; }
+command -v openssl >/dev/null || { echo "ERROR: 'openssl' is required"; exit 1; }
+command -v jq >/dev/null      || { echo "ERROR: 'jq' is required (apt install jq)"; exit 1; }
 
-[[ -s "$SOURCE_SCRIPT" ]] || { echo "ERROR: Script is empty or missing"; exit 1; }
+# ---------------------- Global Cleanup Trap --------------------
+TMPFILES=()
+cleanup() {
+    for f in "${TMPFILES[@]}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT INT TERM
 
-echo "[*] Installing to $INSTALL_PATH ..."
-sudo cp "$SOURCE_SCRIPT" "$INSTALL_PATH"
-sudo chmod 755 "$INSTALL_PATH"
+# ---------------------- Fetch or Use Local ---------------------
+download_or_use_local() {
+    local name="$1"
+    if [[ -f "./$name" ]]; then
+        echo "[*] Using local $name"
+        echo "./$name"
+    else
+        echo "[*] Downloading $name..."
+        local tmp
+        tmp="$(mktemp)" || exit 1
+        TMPFILES+=("$tmp")
+        curl -fsSL "$RAW_URL/$name" -o "$tmp" || { echo "ERROR: Failed to download $name"; exit 1; }
+        echo "$tmp"
+    fi
+}
 
+SRC_MAIN="$(download_or_use_local "$SCRIPT_MAIN")"
+SRC_IMPORTER="$(download_or_use_local "$SCRIPT_IMPORTER")"
+
+# ---------------------- Install Scripts ------------------------
+echo "[*] Installing $SCRIPT_MAIN → $INSTALL_MAIN"
+sudo cp "$SRC_MAIN" "$INSTALL_MAIN"
+sudo chmod 755 "$INSTALL_MAIN"
+
+echo "[*] Installing $SCRIPT_IMPORTER → $INSTALL_IMPORTER"
+sudo cp "$SRC_IMPORTER" "$INSTALL_IMPORTER"
+sudo chmod 755 "$INSTALL_IMPORTER"
+
+# ---------------------- Config File ----------------------------
 if [[ ! -f "$CONFIG_PATH" ]]; then
-    echo "[*] Creating default config at $CONFIG_PATH ..."
-    sudo tee "$CONFIG_PATH" > /dev/null << 'EOF'
-# step-npm-cert configuration (all optional)
+    echo "[*] Creating config → $CONFIG_PATH"
+    sudo tee "$CONFIG_PATH" >/dev/null << 'EOF'
+# step-npm-cert configuration
 #RENEW_DAYS=30
 #AUTO_RELOAD_NPM=0
 #NOT_AFTER="8760h"
@@ -38,16 +68,24 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 #PROV_PW_FILE="/root/.step/secrets/password"
 #CERTDIR="/data/nginx/certificates"
 #NPM_SERVICE="npm.service"
-#LOCKFILE="/tmp/step-npm-cert.lock"
+#NPM_API_URL="http://127.0.0.1:81/api"
+#NPM_USER="admin@example.com"
+#NPM_PASSWORD="changeme"
+#COLOR="auto"
+#QUIET="false"
 EOF
     sudo chmod 644 "$CONFIG_PATH"
 else
     echo "[*] Config already exists → $CONFIG_PATH"
 fi
 
+# ---------------------- Finish ----------------------------
 echo
 echo "[+] Installation complete!"
-echo "    Binary: $INSTALL_PATH"
+echo "    $INSTALL_MAIN"
+echo "    $INSTALL_IMPORTER"
 echo "    Config: $CONFIG_PATH"
 echo
-echo "Run: $SCRIPT_NAME --help"
+echo "Run:"
+echo "    $SCRIPT_MAIN --help"
+echo "    $SCRIPT_IMPORTER --help"
